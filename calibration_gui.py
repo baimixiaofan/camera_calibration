@@ -42,7 +42,7 @@ from tkinter import ttk, filedialog, messagebox
 SETTINGS_FILE = "gui_settings.json"   # 参数记忆文件
 PREVIEW_MAX_W = 360                   # 预览画布最大宽 (像素, 4:3 匹配 320x240)
 PREVIEW_MAX_H = 270                   # 预览画布最大高 (像素)
-PREVIEW_POLL_MS = 50                  # 主线程刷新预览的周期 (ms)
+PREVIEW_POLL_MS = 100                 # 主线程刷新预览的周期 (ms, 10fps 足够标定用)
 ESP32_FETCH_GAP = 0.15                # ESP32 抓图间隔 (秒), 避免请求过密
 USB_RETRY_GAP = 1.0                   # USB 出错重试间隔 (秒)
 MIN_OK_IMAGES = 6                     # 开始标定的最少有效图像数
@@ -266,6 +266,8 @@ class CalibGUI:
                    command=self.capture_one).pack(side="left", **pad)
         ttk.Button(row, text="加载目录全部", width=12,
                    command=self.load_folder_images).pack(side="left", **pad)
+        ttk.Button(row, text="生成棋盘格", width=10,
+                   command=self.gen_board_image).pack(side="left", **pad)
         self.var_cap_status = tk.StringVar(value="预览未启动")
         ttk.Label(box_cap, textvariable=self.var_cap_status,
                   foreground="#0a7a0a").pack(anchor="w", **pad)
@@ -275,7 +277,7 @@ class CalibGUI:
         box_list.pack(fill="both", expand=True, **pad)
         frame_list = ttk.Frame(box_list); frame_list.pack(fill="both", expand=True)
         sb = ttk.Scrollbar(frame_list)
-        self.listbox = tk.Listbox(frame_list, height=7, width=44, yscrollcommand=sb.set,
+        self.listbox = tk.Listbox(frame_list, height=6, width=44, yscrollcommand=sb.set,
                                   font=self._fixed_font)
         sb.config(command=self.listbox.yview)
         self.listbox.pack(side="left", fill="both", expand=True)
@@ -285,6 +287,8 @@ class CalibGUI:
                    command=self.delete_selected).pack(side="left", **pad)
         ttk.Button(row, text="清空全部", width=10,
                    command=self.clear_all).pack(side="left", **pad)
+        ttk.Button(row, text="导出图像", width=10,
+                   command=self.export_images).pack(side="left", **pad)
         self.var_count = tk.StringVar(value="0 张")
         ttk.Label(row, textvariable=self.var_count).pack(side="right", **pad)
 
@@ -306,14 +310,15 @@ class CalibGUI:
         # ---- 结果显示 ----
         box_res = ttk.LabelFrame(left, text=" 标定结果 ")
         box_res.pack(fill="both", expand=True, **pad)
-        self.txt = tk.Text(box_res, height=12, width=48, font=self._fixed_font,
-                           state="disabled", wrap="none")
-        self.txt.pack(fill="both", expand=True, **pad)
+        # 操作按钮放在文本框上方, 避免小屏幕/缩放时被窗口底部裁掉看不见
         row = ttk.Frame(box_res); row.pack(fill="x", **pad)
         ttk.Button(row, text="保存 YAML", width=10,
                    command=self.save_yaml).pack(side="left", **pad)
         ttk.Button(row, text="去畸变预览", width=10,
                    command=self.show_undistorted).pack(side="left", **pad)
+        self.txt = tk.Text(box_res, height=9, width=48, font=self._fixed_font,
+                           state="disabled", wrap="none")
+        self.txt.pack(fill="both", expand=True, **pad)
 
         # ================= 右列: 预览画布 =================
         right = ttk.LabelFrame(main, text=" 预览 (绿线=角点检测成功) ")
@@ -484,20 +489,19 @@ class CalibGUI:
         return None
 
     def _poll_queue(self):
-        """主线程周期任务: 消费队列消息, 更新 UI (每 PREVIEW_POLL_MS)。"""
+        """主线程周期任务: 消费队列消息, 更新 UI (每 PREVIEW_POLL_MS)。
+
+        性能要点: 预览帧在队列里可能积压 (工作线程 > UI 刷新率时),
+        逐帧重绘在 WSLg 的 RDP 显示链路上开销很大, 会明显卡顿;
+        因此旧帧全部丢弃, 每个周期只重绘最新一帧 (帧合并)。
+        """
+        newest_frame = None
         try:
             while True:
                 msg = self.q.get_nowait()
                 kind = msg[0]
                 if kind == "frame":
-                    _, disp, orig, corners, ok = msg
-                    self._show_image(disp)
-                    with self._latest_lock:               # 缓存供"抓取"使用
-                        self._latest = (disp, corners)
-                    self._latest_orig = orig
-                    self.var_cam_status.set(
-                        f"{disp.shape[1]}x{disp.shape[0]}  "
-                        + ("检测到角点" if ok else "未检测到角点"))
+                    newest_frame = msg            # 只留最新, 旧帧丢弃
                 elif kind == "cam_status":
                     self.var_cam_status.set(msg[1])
                 elif kind == "append":
@@ -513,6 +517,15 @@ class CalibGUI:
                     self.var_cap_status.set(msg[1])
         except queue.Empty:
             pass
+        if newest_frame is not None:              # 每周期最多重绘最新一帧
+            _, disp, orig, corners, ok = newest_frame
+            self._show_image(disp)
+            with self._latest_lock:               # 缓存供"抓取"使用
+                self._latest = (disp, corners)
+            self._latest_orig = orig
+            self.var_cam_status.set(
+                f"{disp.shape[1]}x{disp.shape[0]}  "
+                + ("检测到角点" if ok else "未检测到角点"))
         self.root.after(PREVIEW_POLL_MS, self._poll_queue)
 
     def _show_image(self, bgr):
@@ -542,6 +555,50 @@ class CalibGUI:
             raise ValueError("格子边长 (mm) 应在 0.5~1000 之间")
         self._params = {"cols": cols, "rows": rows, "square": square_mm / 1000.0}
         return self._params
+
+    @staticmethod
+    def _draw_board_png(path, cols, rows, px=60):
+        """生成可打印/可投屏的棋盘格 PNG。
+
+        cols/rows: 内角点数 (实际绘制 (cols+1)x(rows+1) 个格子);
+        px: 每格边长 (像素)。白色外边距 2 格, 便于检测和固定。
+        """
+        margin = 2 * px
+        n_cols, n_rows = cols + 1, rows + 1
+        w, h = n_cols * px + 2 * margin, n_rows * px + 2 * margin
+        img = np.full((h, w), 255, np.uint8)
+        for r in range(n_rows):
+            for c in range(n_cols):
+                if (r + c) % 2 == 0:
+                    y, x = margin + r * px, margin + c * px
+                    img[y:y + px, x:x + px] = 0
+        cv2.imwrite(path, img)
+
+    def gen_board_image(self):
+        """按当前配置的行列数生成棋盘格 PNG。
+
+        用法提示: 保存后可直接在笔记本/显示器上全屏打开, 对屏幕拍摄标定
+        (屏幕是平面, 等效标定板)。注意亮度调高、关闭护眼/夜间模式、避免反光。
+        """
+        try:
+            params = self._read_board_params()
+        except ValueError as e:
+            messagebox.showerror("参数错误", str(e))
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".png", initialfile="chessboard.png",
+            filetypes=[("PNG 图片", "*.png")])
+        if not path:
+            return
+        self._draw_board_png(path, params["cols"], params["rows"])
+        self.var_cap_status.set(
+            f"棋盘格已生成 -> {path} (可全屏显示在屏幕上拍摄标定)")
+        messagebox.showinfo(
+            "生成成功",
+            f"已保存: {path}\n\n"
+            "用法: 在笔记本/显示器上全屏打开这张图,\n"
+            "相机对着屏幕变换角度拍摄即可标定。\n"
+            "注意: 亮度调高, 关闭夜间模式/护眼模式, 避免反光。")
 
     def _append_image(self, disp, corners, orig):
         """加入一张有效图像 (disp=带角点叠加的显示图, orig=原始帧)。"""
@@ -621,6 +678,21 @@ class CalibGUI:
             self.images.clear()
             self._refresh_list()
 
+    def export_images(self):
+        """把已采集的原始图像导出到文件夹 (用于离线复现/排查标定问题)。"""
+        if not self.images:
+            messagebox.showinfo("提示", "还没有已采集图像")
+            return
+        folder = filedialog.askdirectory(title="选择导出目录")
+        if not folder:
+            return
+        n = 0
+        for i, it in enumerate(self.images):
+            path = os.path.join(folder, f"img_{i:03d}.jpg")
+            if cv2.imwrite(path, it["orig"]):
+                n += 1
+        self.var_cap_status.set(f"已导出 {n} 张原始图像 -> {folder}")
+
     # ------------------------------------------------------------------
     #                            标定与结果
     # ------------------------------------------------------------------
@@ -685,8 +757,8 @@ class CalibGUI:
             f"多轮: {result['runs_ok']}/{result['runs_total']} 轮成功"
             f" | RMS {rms.mean():.3f} ± {rms.std():.3f} px",
             "-" * 52,
-            f"fx  = {K[0, 0]:8.2f} ± {std[0]:6.2f}",
-            f"fy  = {K[1, 1]:8.2f} ± {std[1]:6.2f}",
+            f"fx  = {K[0, 0]:8.2f} ± {std[0]:6.2f}   (相对 {std[0] / K[0, 0] * 100:.2f}%)",
+            f"fy  = {K[1, 1]:8.2f} ± {std[1]:6.2f}   (相对 {std[1] / K[1, 1] * 100:.2f}%)",
             f"cx  = {K[0, 2]:8.2f} ± {std[2]:6.2f}",
             f"cy  = {K[1, 2]:8.2f} ± {std[3]:6.2f}",
             "-" * 52,
@@ -697,8 +769,22 @@ class CalibGUI:
             f"  p2 = {dm[3]: .4f} ± {ds[3]:.4f}",
             f"  k3 = {dm[4]: .4f} ± {ds[4]:.4f}",
             "-" * 52,
-            "提示: 标准差大 -> 姿态多样性不足, 建议补充不同角度/距离的图像",
         ]
+        # 按数值判定哪类参数不够稳 (标准差阈值: 焦距看相对值, 其余看绝对值)
+        warn = []
+        if std[0] / K[0, 0] > 0.005 or std[1] / K[1, 1] > 0.005:
+            warn.append("fx/fy (需要不同距离/倾斜)")
+        if std[2] > 1.5 or std[3] > 1.5:
+            warn.append("cx/cy (需要棋盘覆盖画面四角)")
+        if ds[0] > 0.01:
+            warn.append("k1 (需要画面四角+倾斜)")
+        if ds[2] > 0.002 or ds[3] > 0.002:
+            warn.append("p1/p2 (需要多角度倾斜)")
+        if warn:
+            lines.append("标准差偏大: " + "; ".join(warn))
+            lines.append("建议按括号内提示补拍姿态多样化的图像后再标定。")
+        else:
+            lines.append("各参数标准差均在健康范围, 结果稳定, 可直接使用。")
         self._set_text("\n".join(lines))
         self.var_cap_status.set("标定完成! 可保存 YAML 或查看去畸变效果")
 
@@ -724,6 +810,9 @@ class CalibGUI:
         fs.write("image_height", r["size"][1])
         fs.write("camera_matrix", r["K_mean"])
         fs.write("dist_coeffs", r["dist_mean"].reshape(1, 5))
+        # 多轮标准差 (诊断用: 判断各参数是否稳定)
+        fs.write("camera_matrix_std_fx_fy_cx_cy", r["K_std"].reshape(1, 4))
+        fs.write("dist_coeffs_std", r["dist_std"].reshape(1, 5))
         fs.write("rms_reproj_error_mean", float(np.mean(r["rms_list"])))
         fs.write("rms_reproj_error_std", float(np.std(r["rms_list"])))
         fs.write("n_images", r["n_images"])
@@ -785,7 +874,27 @@ def _pick_cjk_fonts():
     return reg, mono
 
 
+def _probe_vcxsrv(host="127.0.0.1", port=6000, timeout=0.3):
+    """探测 Windows 侧是否运行着 VcXsrv (X server 监听 6000 端口)。
+
+    背景: WSLg 的显示走 RDP 编码流水线, 频繁重绘会卡顿;
+    VcXsrv 是本地 X11 直连, 明显更流畅。
+    返回 True 表示有原生 X server 可用。
+    """
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def main():
+    # 显示路径自动选择: VcXsrv 已启动 -> 用它 (127.0.0.1:0, 须 WSL2 mirrored 网络);
+    # 否则回落 WSLg 的 :0。这样用户双击 vcxsrv.xlaunch 即获得流畅模式, 零配置。
+    if _probe_vcxsrv():
+        os.environ["DISPLAY"] = "127.0.0.1:0"
+        print("[显示] 使用 VcXsrv (X11 直连, 流畅模式)")
     root = tk.Tk()
     CalibGUI(root)
     root.mainloop()
