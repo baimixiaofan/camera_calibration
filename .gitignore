@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 运行时生成的文件
+gui_settings.json
+
+# 标定输出
+calib_output/
+calib_result*.yaml
